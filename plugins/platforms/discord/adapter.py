@@ -4328,17 +4328,33 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             except Exception as e:
                 logger.debug("[Discord] Admin notify via %s failed: %s", target, e)
 
+    # Safety cap for persistent typing loops (see send_typing): a turn that
+    # crashes or is interrupted between send_typing and stop_typing leaves an
+    # orphaned loop that shows a ghost "typing..." indicator forever (2026-10-29
+    # field incident). 300s is far beyond any legitimate turn's typing window.
+    MAX_TYPING_SECONDS = 300
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing loop (POST typing every 12s; indicator lasts ~10s).
-        TYPING_START is unreliable for bots in DMs; 429 sleeps ``retry_after``; CancelledError ends it."""
+        TYPING_START is unreliable for bots in DMs; 429 sleeps ``retry_after``; CancelledError ends it.
+        The loop self-expires after MAX_TYPING_SECONDS so an interrupted turn
+        cannot leak a ghost typing indicator (see class docstring on the cap)."""
         if not self._client:
             return
         if chat_id in self._typing_tasks:
             return
 
         async def _typing_loop() -> None:
+            deadline = asyncio.get_running_loop().time() + self.MAX_TYPING_SECONDS
             try:
                 while True:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        logger.warning(
+                            "Discord typing loop for %s exceeded %ss cap; stopping — "
+                            "stop_typing was never called (leaked/aborted turn?)",
+                            chat_id, self.MAX_TYPING_SECONDS,
+                        )
+                        return
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing", channel_id=chat_id,
